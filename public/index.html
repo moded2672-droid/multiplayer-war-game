@@ -1,0 +1,242 @@
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+const PORT = process.env.PORT || 3000;
+const WORLD_WIDTH = 1600;
+const WORLD_HEIGHT = 1000;
+const PLAYER_RADIUS = 18;
+const BULLET_RADIUS = 5;
+const PLAYER_SPEED = 220;
+const BULLET_SPEED = 520;
+const PLAYER_MAX_HEALTH = 100;
+const RESPAWN_TIME = 2200;
+
+const players = new Map();
+const bullets = new Map();
+const messages = [];
+
+function randomBetween(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function getPlayerById(id) {
+  return players.get(id);
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function createPlayer(id, name) {
+  const x = randomBetween(50, WORLD_WIDTH - 50);
+  const y = randomBetween(50, WORLD_HEIGHT - 50);
+
+  return {
+    id,
+    name,
+    x,
+    y,
+    angle: 0,
+    health: PLAYER_MAX_HEALTH,
+    maxHealth: PLAYER_MAX_HEALTH,
+    alive: true,
+    respawnAt: 0,
+    moveX: 0,
+    moveY: 0,
+    shootHeld: false,
+    lastShotAt: 0,
+    kills: 0,
+    deaths: 0,
+    color: `hsl(${Math.floor(Math.random() * 360)}, 80%, 60%)`
+  };
+}
+
+function createBullet(ownerId, x, y, angle) {
+  const speedX = Math.cos(angle) * BULLET_SPEED;
+  const speedY = Math.sin(angle) * BULLET_SPEED;
+
+  const bulletId = `${Date.now()}-${Math.random()}`;
+
+  bullets.set(bulletId, {
+    id: bulletId,
+    ownerId,
+    x,
+    y,
+    vx: speedX,
+    vy: speedY,
+    life: 1.6,
+    radius: BULLET_RADIUS
+  });
+}
+
+function updatePlayers(delta) {
+  for (const player of players.values()) {
+    if (!player.alive) {
+      if (Date.now() >= player.respawnAt) {
+        player.x = randomBetween(50, WORLD_WIDTH - 50);
+        player.y = randomBetween(50, WORLD_HEIGHT - 50);
+        player.health = PLAYER_MAX_HEALTH;
+        player.alive = true;
+        player.angle = 0;
+      }
+      continue;
+    }
+
+    const moveX = (player.moveX || 0);
+    const moveY = (player.moveY || 0);
+    const length = Math.hypot(moveX, moveY) || 1;
+
+    const scaledX = (moveX / length) * PLAYER_SPEED;
+    const scaledY = (moveY / length) * PLAYER_SPEED;
+
+    player.x = clamp(player.x + scaledX * delta, PLAYER_RADIUS, WORLD_WIDTH - PLAYER_RADIUS);
+    player.y = clamp(player.y + scaledY * delta, PLAYER_RADIUS, WORLD_HEIGHT - PLAYER_RADIUS);
+
+    if (player.shootHeld && Date.now() - player.lastShotAt > 180) {
+      createBullet(player.id, player.x + Math.cos(player.angle) * 28, player.y + Math.sin(player.angle) * 28, player.angle);
+      player.lastShotAt = Date.now();
+    }
+  }
+}
+
+function updateBullets(delta) {
+  for (const [bulletId, bullet] of [...bullets]) {
+    bullet.x += bullet.vx * delta;
+    bullet.y += bullet.vy * delta;
+    bullet.life -= delta;
+
+    if (
+      bullet.x < -20 ||
+      bullet.x > WORLD_WIDTH + 20 ||
+      bullet.y < -20 ||
+      bullet.y > WORLD_HEIGHT + 20 ||
+      bullet.life <= 0
+    ) {
+      bullets.delete(bulletId);
+      continue;
+    }
+
+    for (const [playerId, player] of players) {
+      if (!player.alive || playerId === bullet.ownerId) {
+        continue;
+      }
+
+      const dx = bullet.x - player.x;
+      const dy = bullet.y - player.y;
+      const distance = Math.hypot(dx, dy);
+
+      if (distance < PLAYER_RADIUS + bullet.radius) {
+        player.health -= 18;
+        bullets.delete(bulletId);
+
+        if (player.health <= 0) {
+          const killer = getPlayerById(bullet.ownerId);
+          if (killer) {
+            killer.kills += 1;
+            messages.unshift(`${killer.name} eliminated ${player.name}!`);
+            if (messages.length > 5) messages.pop();
+          }
+
+          player.deaths += 1;
+          player.alive = false;
+          player.respawnAt = Date.now() + RESPAWN_TIME;
+          player.health = 0;
+        }
+
+        break;
+      }
+    }
+  }
+}
+
+function sendGameState() {
+  const state = {
+    world: { width: WORLD_WIDTH, height: WORLD_HEIGHT },
+    players: [...players.values()].map((player) => ({
+      id: player.id,
+      name: player.name,
+      x: player.x,
+      y: player.y,
+      angle: player.angle,
+      health: player.health,
+      maxHealth: player.maxHealth,
+      alive: player.alive,
+      kills: player.kills,
+      deaths: player.deaths,
+      color: player.color
+    })),
+    bullets: [...bullets.values()].map((bullet) => ({
+      id: bullet.id,
+      x: bullet.x,
+      y: bullet.y,
+      radius: bullet.radius
+    })),
+    messages
+  };
+
+  io.emit('state', state);
+}
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', players: players.size });
+});
+
+io.on('connection', (socket) => {
+  socket.on('join', (data) => {
+    const name = (data && data.name ? String(data.name).slice(0, 18) : 'Player').trim() || 'Player';
+    const player = createPlayer(socket.id, name);
+    players.set(socket.id, player);
+
+    socket.emit('joined', { id: socket.id, name: player.name, world: { width: WORLD_WIDTH, height: WORLD_HEIGHT } });
+
+    io.emit('system', `${player.name} joined the arena.`);
+  });
+
+  socket.on('input', (input) => {
+    const player = players.get(socket.id);
+    if (!player) return;
+
+    const moveX = Number(input?.moveX || 0);
+    const moveY = Number(input?.moveY || 0);
+    const shootHeld = Boolean(input?.shootHeld);
+    const angle = Number(input?.angle || 0);
+
+    player.moveX = moveX;
+    player.moveY = moveY;
+    player.shootHeld = shootHeld;
+    player.angle = angle;
+  });
+
+  socket.on('disconnect', () => {
+    const player = players.get(socket.id);
+    if (player) {
+      io.emit('system', `${player.name} left the arena.`);
+      players.delete(socket.id);
+    }
+  });
+});
+
+const TICK_RATE = 1 / 60;
+let lastTime = Date.now();
+
+setInterval(() => {
+  const now = Date.now();
+  const delta = (now - lastTime) / 1000;
+  lastTime = now;
+
+  updatePlayers(delta);
+  updateBullets(delta);
+  sendGameState();
+}, TICK_RATE * 1000);
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`LAN War Arena running on http://0.0.0.0:${PORT}`);
+});
